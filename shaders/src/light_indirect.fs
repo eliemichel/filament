@@ -127,30 +127,6 @@ vec3 specularDFG(const PixelParams pixel) {
 #endif
 }
 
-/**
- * Returns the reflected vector at the current shading point. The reflected vector
- * return by this function might be different from shading_reflected:
- * - For anisotropic material, we bend the reflection vector to simulate
- *   anisotropic indirect lighting
- * - The reflected vector may be modified to point towards the dominant specular
- *   direction to match reference renderings when the roughness increases
- */
-
-vec3 getReflectedVector(const PixelParams pixel, const vec3 v, const vec3 n) {
-#if defined(MATERIAL_HAS_ANISOTROPY)
-    vec3  anisotropyDirection = pixel.anisotropy >= 0.0 ? pixel.anisotropicB : pixel.anisotropicT;
-    vec3  anisotropicTangent  = cross(anisotropyDirection, v);
-    vec3  anisotropicNormal   = cross(anisotropicTangent, anisotropyDirection);
-    float bendFactor          = abs(pixel.anisotropy) * saturate(5.0 * pixel.perceptualRoughness);
-    vec3  bentNormal          = normalize(mix(n, anisotropicNormal, bendFactor));
-
-    vec3 r = reflect(-v, bentNormal);
-#else
-    vec3 r = reflect(-v, n);
-#endif
-    return r;
-}
-
 vec3 getReflectedVector(const PixelParams pixel, const vec3 n) {
 #if defined(MATERIAL_HAS_ANISOTROPY)
     vec3 r = getReflectedVector(pixel, shading_view, n);
@@ -575,17 +551,26 @@ void evaluateIBL(const MaterialInputs material, const PixelParams pixel, inout v
     // specular layer
     vec3 Fr = vec3(0.0f);
 
+    SSAOInterpolationCache interpolationCache;
+#if defined(BLEND_MODE_OPAQUE) || defined(BLEND_MODE_MASKED) || defined(MATERIAL_HAS_REFLECTIONS)
+    interpolationCache.uv = uvToRenderTargetUV(getNormalizedViewportCoord().xy);
+#endif
+
     // screen-space reflections
-#if defined(MATERIAL_HAS_REFLECTIONS) && REFLECTION_MODE == REFLECTION_MODE_SCREEN_SPACE
     vec4 Fssr = vec4(0.0f);
-    // evaluateScreenSpaceReflections will set the value of ssr if there's a hit.
-    // ssr.a contains the reflection's contribution.
-    if (pixel.roughness <= 0.1f && frameUniforms.ssrDistance > 0.0f) {
-        vec3 r = getReflectedVector(pixel, shading_view, shading_normal);
-        Fssr = evaluateScreenSpaceReflections(pixel, r);
+#if defined(MATERIAL_HAS_REFLECTIONS) && !defined(MATERIAL_HAS_REFRACTION)
+    #if defined(BLEND_MODE_OPAQUE) || defined(BLEND_MODE_MASKED)
+    // There is no point doing SSR for very high roughness because we're limited by the fov
+    // of the screen, in addition it doesn't really add much to the final image.
+    // TODO: maybe make this a parameter
+    const float maxRoughness = 0.5;
+    if (frameUniforms.ssrDistance > 0.0f && pixel.roughness < maxRoughness) {
+        float lod = max(0.0, 2.0 * log2(pixel.perceptualRoughness) + frameUniforms.refractionLodOffset);
+        Fssr = textureLod(light_ssr, interpolationCache.uv, lod);
     }
-#else
-    const vec4 Fssr = vec4(0.0f);
+    #else
+    // TODO: for blended transparency, we have to ray-march here (limited to mirror reflections)
+    #endif
 #endif
 
     // If screen-space reflections are turned on and have full contribution (ssr.a == 1.0f), then we
@@ -604,16 +589,7 @@ void evaluateIBL(const MaterialInputs material, const PixelParams pixel, inout v
     }
 #endif
 
-#if defined(MATERIAL_HAS_REFLECTIONS)
-    Fssr.rgb *= E;
-#endif
-
-    // Ambiant occlusion
-    SSAOInterpolationCache interpolationCache;
-#if defined(BLEND_MODE_OPAQUE) || defined(BLEND_MODE_MASKED)
-    interpolationCache.uv = uvToRenderTargetUV(getNormalizedViewportCoord().xy);
-#endif
-
+    // Ambient occlusion
     float ssao = evaluateSSAO(interpolationCache);
     float diffuseAO = min(material.ambientOcclusion, ssao);
     float specularAO = specularAO(shading_NoV, diffuseAO, pixel.roughness, interpolationCache);
@@ -658,11 +634,15 @@ void evaluateIBL(const MaterialInputs material, const PixelParams pixel, inout v
     vec3 Ft = evaluateRefraction(pixel, shading_normal, E);
 #endif
 
+#if defined(MATERIAL_HAS_REFLECTIONS)
+    Fssr.rgb *= E;
+#endif
+
     // Combine all terms
     // Note: iblLuminance is already premultiplied by the exposure
 #if defined(MATERIAL_HAS_REFRACTION) && defined(MATERIAL_HAS_REFLECTIONS)
     color.rgb +=
-            Fr * (frameUniforms.iblLuminance * (1.0 - Fssr.a)) + Fssr.rgb * Fssr.a +
+            Fr * (frameUniforms.iblLuminance * (1.0 - Fssr.a)) + Fssr.rgb +
             Fd * (frameUniforms.iblLuminance * (1.0 - pixel.transmission)) +
             Ft * pixel.transmission;
 #elif defined(MATERIAL_HAS_REFRACTION)
@@ -672,7 +652,7 @@ void evaluateIBL(const MaterialInputs material, const PixelParams pixel, inout v
             Ft * pixel.transmission;
 #elif defined(MATERIAL_HAS_REFLECTIONS)
     color.rgb +=
-            Fr * (frameUniforms.iblLuminance * (1.0 - Fssr.a)) + Fssr.rgb * Fssr.a +
+            Fr * (frameUniforms.iblLuminance * (1.0 - Fssr.a)) + Fssr.rgb +
             Fd * frameUniforms.iblLuminance;
 #else
     color.rgb += (Fd + Fr) * frameUniforms.iblLuminance;

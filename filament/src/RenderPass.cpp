@@ -199,6 +199,12 @@ void RenderPass::setupColorCommand(Command& cmdDraw,
 
     cmdDraw.key = isBlendingCommand ? keyBlending : keyDraw;
     cmdDraw.primitive.rasterState = ma->getRasterState();
+    if (!isBlendingCommand && Variant::isSSRVariant(variant)) {
+        // for SSR pass, the blending mode of opaques (including MASKED) must be off
+        // see Material.cpp.
+        cmdDraw.primitive.rasterState.blendFunctionSrcAlpha = BlendFunction::ONE;
+        cmdDraw.primitive.rasterState.blendFunctionDstAlpha = BlendFunction::ZERO;
+    }
     cmdDraw.primitive.rasterState.inverseFrontFaces = inverseFrontFaces;
     cmdDraw.primitive.rasterState.culling = mi->getCullingMode();
     cmdDraw.primitive.rasterState.colorWrite = mi->getColorWrite();
@@ -273,9 +279,9 @@ void RenderPass::generateCommandsImpl(uint32_t extraFlags,
 
     static_assert(isColorPass != isDepthPass, "only color or depth pass supported");
 
-    const bool depthContainsShadowCasters = bool(extraFlags & CommandTypeFlags::DEPTH_CONTAINS_SHADOW_CASTERS);
-    const bool depthFilterTranslucentObjects = bool(extraFlags & CommandTypeFlags::DEPTH_FILTER_TRANSLUCENT_OBJECTS);
-    const bool depthFilterAlphaMaskedObjects = bool(extraFlags & CommandTypeFlags::DEPTH_FILTER_ALPHA_MASKED_OBJECTS);
+    const bool depthContainsShadowCasters       = bool(extraFlags & CommandTypeFlags::DEPTH_CONTAINS_SHADOW_CASTERS);
+    const bool depthFilterAlphaMaskedObjects    = bool(extraFlags & CommandTypeFlags::DEPTH_FILTER_ALPHA_MASKED_OBJECTS);
+    const bool filterTranslucentObjects         = bool(extraFlags & CommandTypeFlags::FILTER_TRANSLUCENT_OBJECTS);
 
     auto const* const UTILS_RESTRICT soaWorldAABBCenter = soa.data<FScene::WORLD_AABB_CENTER>();
     auto const* const UTILS_RESTRICT soaVisibility      = soa.data<FScene::VISIBILITY_STATE>();
@@ -292,7 +298,7 @@ void RenderPass::generateCommandsImpl(uint32_t extraFlags,
     if constexpr (isDepthPass) {
         cmdDepth.primitive.materialVariant = variant;
         cmdDepth.primitive.rasterState = {};
-        cmdDepth.primitive.rasterState.colorWrite = variant.hasPicking() || variant.hasVsm();
+        cmdDepth.primitive.rasterState.colorWrite = Variant::isPickingVariant(variant) || Variant::isVSMVariant(variant);
         cmdDepth.primitive.rasterState.depthWrite = true;
         cmdDepth.primitive.rasterState.depthFunc = RasterState::DepthFunc::GE;
         cmdDepth.primitive.rasterState.alphaToCoverage = false;
@@ -348,7 +354,9 @@ void RenderPass::generateCommandsImpl(uint32_t extraFlags,
 
         cmdColor.key = makeField(soaVisibility[i].priority, PRIORITY_MASK, PRIORITY_SHIFT);
         cmdColor.primitive.index = (uint16_t)i;
-        variant.setShadowReceiver(soaVisibility[i].receiveShadows & hasShadowing);
+        if (!Variant::isSSRVariant(variant)) {
+            variant.setShadowReceiver(soaVisibility[i].receiveShadows & hasShadowing);
+        }
         variant.setSkinning(soaVisibility[i].skinning || soaVisibility[i].morphing);
 
         if constexpr (isDepthPass) {
@@ -426,6 +434,9 @@ void RenderPass::generateCommandsImpl(uint32_t extraFlags,
                     // correct for TransparencyMode::DEFAULT -- i.e. cancel the command
                     key |= select(mode == TransparencyMode::DEFAULT);
 
+                    // cancel command if asked to filter translucents
+                    key |= select(filterTranslucentObjects);
+
                     *curr = cmdColor;
                     curr->key = key;
                     ++curr;
@@ -441,6 +452,7 @@ void RenderPass::generateCommandsImpl(uint32_t extraFlags,
                     cmdColor.primitive.rasterState.depthFunc =
                             (mode == TransparencyMode::TWO_PASSES_ONE_SIDE) ?
                             SamplerCompareFunc::GE : cmdColor.primitive.rasterState.depthFunc;
+
                 } else {
                     // color pass:
                     // This will bucket objects by Z, front-to-back and then sort by material
@@ -481,7 +493,7 @@ void RenderPass::generateCommandsImpl(uint32_t extraFlags,
                 // FIXME: should writeDepthForShadowCasters take precedence over mi->getDepthWrite()?
                 cmdDepth.primitive.rasterState.depthWrite = (1 // only keep bit 0
                         & (mi->getDepthWrite() | (mode == TransparencyMode::TWO_PASSES_ONE_SIDE))
-                        & !(depthFilterTranslucentObjects & translucent)
+                        & !(filterTranslucentObjects & translucent)
                         & !(depthFilterAlphaMaskedObjects & rs.alphaToCoverage))
                             | writeDepthForShadowCasters;
                 *curr = cmdDepth;
